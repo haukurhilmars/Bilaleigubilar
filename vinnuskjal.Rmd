@@ -1,0 +1,843 @@
+---
+title: "Vinnuskjal"
+author: "Haukur Hilmarsson"
+date: "12/29/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(readxl)
+library(truncnorm)
+library(lubridate)
+library(leaflet)
+library(kableExtra)
+library(plotly)
+library(forcats)
+library(scales)
+library(Cairo)
+
+stadir_orig <- read_xlsx('stadir2.xlsx')
+bilar <- read_xlsx("bilar.xlsx")
+```
+
+# Vinnuskjal
+
+## Hugsað til að keyra út niðurstöður úr líkaninu sem hægt er að skila á skýrsluformi. Tekur langan tíma að fikta í shiny-appinu í hvert skipti
+
+```{r, include=FALSE}
+#Forsendur
+mogul_stadir <- c("Þingvellir (Hakið)", "Jökulsárlón", "Seljalandsfoss", "Hraunfossar", "Hvítserkur",  "Dimmuborgir (Mývatn)", "Reynisfjara", "Keflavík") #8
+
+
+valinn_stadur <- mogul_stadir[1]
+hledsla_kw <- 20 # Meðalafl á hvern bíl úr deili hleðslukerfi
+fj_per_bil <-  2.5 # 2.5 ferðamenn í hverjum bíl
+hlutf_a_bil <- 0.6 #60 % bíla einkabílar
+hlutf_rafbilar <- 0.6 # 10/30/60 % bílaleigubíla rafbílar
+valinn_manudur <- "aug" #Valinn mánuður
+
+fj_monte_carlo <- 300
+hotel <- TRUE
+virk_80 <-  FALSE
+virk_100 <- FALSE
+
+```
+
+
+```{r, include = FALSE}
+#Náum í upplýsingar úr staðarskjalinu um staðsetningu hvaðan ferðamenn koma
+
+filter_func <- function(breyta){
+  filter(stadir_orig, stadur==valinn_stadur)%>%
+    select(all_of(breyta))%>%
+    pull()
+}
+
+km_std1 <- filter_func("std_1_km") #Km frá stað 1
+km_std2 <- filter_func("std_2_km") #Km frá stað 2
+km_std3 <- filter_func("std_3_km") #Km frá stað 3
+
+hltf_std1 <- filter_func("hltf_1") #Hlutfall bíla sem kemur frá stað 1
+hltf_std2 <- filter_func("hltf_2") #Hlutfall bíla sem kemur frá stað 2
+hltf_std3 <- filter_func("hltf_3") #Hlutfall bíla sem kemur frá stað 3
+
+latid <-  filter_func("lat") #Latitude
+longtd <-  filter_func("long") #Longditude
+
+
+```
+
+```{r, include=FALSE}
+#Fjöldi og dreifing ferðamanna innan dags
+
+#Náum í fjölda ferðamanna fyrir hvern mánuð og fjölda á dag
+
+manudir <- filter(stadir_orig, stadur == valinn_stadur)%>%
+  select(jan, feb, mar, apr, mai, jun, jul, aug, sep, oct, nov, dec) #DF með öllum mánuðum
+
+manadar_fjoldi <- select(manudir, all_of(valinn_manudur))%>% #Náum í fjölda fyrir valinn mánuð
+  pull()
+
+dagar  <- manudir %>%
+  mutate_all(function(x){x/30}) #DF, fjöldi á dag efti mánuðum
+
+fj_dag <- select(dagar, all_of(valinn_manudur))%>% 
+  pull() #Fjöldi á dag fyrir valinn mánuð
+
+# Náum í upplýsingar um dreifingu ferðamanna
+
+toppur_1 <-  filter_func("toppur1") 
+toppur_2 <-  filter_func("toppur2")
+breidd_1 <-  filter_func("breidd_topps1") 
+breidd_2 <-  filter_func("breidd_topps2")
+hlutf_1 <-  filter_func("hlutf_toppur1")/100
+hlutf_2 <-  filter_func("hlutf_toppur2")/100
+opn_timi <-  filter_func("opntimi")
+opn_klst <-  filter_func("opnklst")
+lokunartimi <- opn_timi+opn_klst
+
+```
+
+### Valinn staður: `r valinn_stadur`
+
+Staðsetning
+
+```{r, echo=FALSE}
+leaflet() %>%
+       setView(lng = longtd, lat = latid, zoom = 6)%>%
+       addProviderTiles(providers$CartoDB.Positron)%>%
+       addMarkers(longtd, latid, label =valinn_stadur)
+```
+
+
+
+```{r, include=FALSE}
+# Líkindareikningur
+fj_bila_dag <- round(fj_dag*hlutf_a_bil/fj_per_bil,0) #Fjöldi bíla á dag, miðum við fjölda bíla á dag út frá fjölda ferðamanna og hversu margir eru á einkabíl
+
+#Drögum tímasetningar bíla út frá normaldreifingu byggt á toppi og breidd
+timasetningar <- if(valinn_stadur != "Keflavík"){
+  rtruncnorm(fj_bila_dag*fj_monte_carlo, opn_timi, lokunartimi, toppur_1, breidd_1)
+} else{
+  tibble(
+    fyrri = rtruncnorm(fj_bila_dag*fj_monte_carlo, opn_timi, lokunartimi, toppur_1, breidd_1),
+    seinni = rtruncnorm(fj_bila_dag*fj_monte_carlo, opn_timi, lokunartimi, toppur_2, breidd_2),
+    rand = sample(c(1,0),fj_bila_dag*fj_monte_carlo, replace = TRUE, prob=c(hlutf_1, hlutf_2)))%>%
+    mutate(val = ifelse(rand == 1, fyrri, seinni))%>%
+    select(val)%>%
+    pull(all_of(val))
+}
+
+#Hvort að bíll sé rafbíll eða ekki ræðst af hlutfalli rafbíla
+rafbill <- sample(c(0,1), fj_bila_dag*fj_monte_carlo, replace = T, prob =c(1-hlutf_rafbilar, hlutf_rafbilar))
+
+#Drögum upphafsstöðu rafhlöðu úr líkindadreifingu sem er fyrir áhrifum af uppbyggingu á gististöðum
+upphafst_rafh <-  if(hotel == TRUE){
+  rtruncnorm(fj_bila_dag*fj_monte_carlo, a = 0, b = 100, 95, 5)
+} else {
+      rtruncnorm(fj_bila_dag*fj_monte_carlo,0,100, 60, 25)
+}
+
+#Drögum tegund bíls úr líkindadreifingu með 3 möguleika sem eru fyrirfram ákveðnir
+teg_bils <- sample(c("teg1","teg2","teg3"),fj_bila_dag*fj_monte_carlo, replace=T, prob= c(0,1,0))
+
+#Upphafsstaða rafhlöðu kwh *********
+temp <- filter(bilar, tegund == "teg1")%>%
+    select(rafhlada)
+max1 <- temp[[1]]
+temp <- filter(bilar, tegund == "teg2")%>%
+    select(rafhlada)
+max2 <- temp[[1]]
+temp <- filter(bilar, tegund == "teg3")%>%
+    select(rafhlada)
+max3 <- temp[[1]]
+  
+upph_stada_kwh <- function(tegund, upph_hledsla){
+    if ( tegund == "teg1"){
+      max  <-  max1
+    }
+    else if ( tegund == "teg2"){
+      max <-  max2
+    }
+    else {
+      max <- max3
+    }
+    max*upph_hledsla/100
+}
+
+#Drögum ekna km við komu á stað úr líkindadreifingu byggt á áætluðum upphafsstöðum
+eknir_km <- sample(c(km_std1, km_std2, km_std3), fj_bila_dag*fj_monte_carlo, replace = T, prob =c(hltf_std1, hltf_std2, hltf_std3))
+
+#Eyðsla - 
+  
+temp <- filter(bilar, tegund == "teg1")%>%
+    select(eydsla)
+eydsla1 <- temp[[1]]
+  
+temp <- filter(bilar, tegund == "teg2")%>%
+    select(eydsla)
+eydsla2 <- temp[[1]]
+  
+temp <- filter(bilar, tegund == "teg3")%>%
+    select(eydsla)
+eydsla3 <- temp[[1]]
+  
+eydsla_total <- function(tegund, km){
+    if ( tegund == "teg1"){
+      eydsla  <-  eydsla1
+    }
+    else if ( tegund == "teg2"){
+      eydsla <-  eydsla2
+    }
+    else {
+      eydsla <- eydsla3
+    }
+    eydsla*km
+}
+
+#Stada kwh við komu
+loka_stada_kwh <- function(upph_kwh, eydsla_kwh){
+  if(upph_kwh-eydsla_kwh<0){
+    v = sample(1:5,1)
+  }else{
+    v= upph_kwh-eydsla_kwh
+  }
+    v
+}
+
+#stada batterý hlutfallslega við komu
+loka_stada <- function(upph_kwh, loka_kwh){
+     upph_kwh/loka_kwh
+}
+
+#kwh 100
+#Skrifum þetta function m.v. að allir séu tegund 2 (tímasparnaður stutt í deadline)
+
+kwh_100 <-  function(kwh_upph_hledslu, kwh_lok_hledslu=100){
+   kwh_lok_hledslu-kwh_upph_hledslu
+   
+}
+
+#kwh 80
+#Skrifum þetta function m.v. að allir séu tegund 2 (tímasparnaður stutt í deadline)
+kwh_80 <-  function(kwh_upph_hledslu, kwh_lok_hledslu=80){
+   ifelse(kwh_lok_hledslu-kwh_upph_hledslu<0,0,kwh_lok_hledslu-kwh_upph_hledslu) # Ef staða í upphafi er meira en 80% skilum við 0
+}
+
+#Tími sem er stoppað
+timi_stopp <-  rtruncnorm(fj_bila_dag*fj_monte_carlo, 0, Inf, 1, 0.25) #Meðaltal klst, 15 min í staðalfrávik
+
+#Hleðslutími
+timi_hlada <- function(kwh_100,kwh_80,stopptimi){
+   if(virk_100 == TRUE){
+      timi_hlad <- kwh_100/hledsla_kw
+      
+   }
+   else if(virk_80 == TRUE){
+      timi_hlad <- kwh_80/hledsla_kw
+   } else {
+      timi_hlad <- stopptimi
+   }
+   timi_hlad
+}
+
+#Tími tengdur
+
+timi_tengdur <- function(kwh_100,kwh_80,stopptimi){
+   if(virk_100 == TRUE){
+      timi_hlad <- ifelse(kwh_100/hledsla_kw<stopptimi,kwh_100/hledsla_kw,stopptimi)
+   }
+   else if(virk_80 == TRUE){
+      timi_hlad <- ifelse(kwh_80/hledsla_kw<stopptimi,kwh_80/hledsla_kw,stopptimi)
+   } else {
+      timi_hlad <- stopptimi
+   }
+   timi_hlad
+}
+
+#Líkur á að hlaða
+
+prop_hlada <- function(stada, kef){ #Erum með eina líkindadreifingu fyrir keflavík og aðra fyrir hina staðina
+     if (kef != 1){
+       if ( stada < 0.25){
+         a=1
+       }
+       else if (stada < 0.5){
+         a=0.8
+       }
+       else if (stada < 0.8){
+         a=0.5
+       }
+       else{
+         a=0
+       }
+       a
+     }
+     else{
+       if ( stada < 0.25){
+         a=1
+       }
+       else if (stada < 0.5){
+         a=1
+       }
+       else if (stada < 0.8){
+         a=0.9
+       }
+       else{
+         a=0
+       }
+       a
+     }
+}
+
+#Setjum inn dummy breytu fyrir Keflavík
+kef_func <- if (valinn_stadur == "Keflavík"){
+       rep(1, fj_bila_dag*fj_monte_carlo)
+     } else{
+      rep(0, fj_bila_dag*fj_monte_carlo)
+     }
+    
+#hledur ? JÁ/NEI
+hledur <- function(prob){
+     sample(c(0,1),1,replace=T, prob=c(1-prob, prob))
+}
+
+#Setjum inn mismunandi dreifingu á eknum km fyrir og eftir hádegi í Kef
+kef_hadegi_func <-  function(ehk, km){
+     ifelse(ehk == 0, km,
+            ifelse(km<100, km*2, km))
+   }
+
+#Merking - Merkjum hverja MC hermun fyrir plot á eftir
+merking <- rep(c(1:fj_monte_carlo), each=fj_bila_dag)
+
+
+```
+
+
+
+
+```{r, echo =FALSE, warning=FALSE, message=FALSE}
+
+#SETJUM ALLT í 1 DF SEM VIÐ VINNUM SVO MEÐ
+
+ferdamenn <- tibble(
+     timasetn_bill = timasetningar,
+     rafbill = rafbill,
+     upphafst_rafh = upphafst_rafh,
+     eknir_km = eknir_km,
+     keflavik = kef_func,
+     eftir_hadegi_kef = ifelse(timasetn_bill > 12 & keflavik == 1, 1, 0),
+     eknir_km2 = as.numeric(map2(eftir_hadegi_kef, eknir_km, kef_hadegi_func)),
+     teg_bils = teg_bils,
+     upph_stada_kwh = as.numeric(map2(teg_bils, upphafst_rafh, upph_stada_kwh)),
+     eydsla_kwh = as.numeric(map2(teg_bils, eknir_km2, eydsla_total)),
+     stada_kwh = as.numeric(map2(upph_stada_kwh, eydsla_kwh, loka_stada_kwh)),
+     kwh80 = as.numeric(map(stada_kwh, kwh_80)),
+     kwh100 = as.numeric(map(stada_kwh, kwh_100)),
+     stada_hlutf = as.numeric(map2(stada_kwh,upph_stada_kwh, loka_stada)),
+     likur_hlada = as.numeric(map2(stada_hlutf, keflavik, prop_hlada)),
+     hledur = as.numeric(map(likur_hlada, hledur)),
+     merki = merking,
+     timistopp = timi_stopp,
+     timihlada = round(as.numeric(pmap(list(kwh100,kwh80,timistopp), timi_hlada)),2),
+     timi_tengdur = round(as.numeric(pmap(list(kwh100,kwh80,timistopp), timi_tengdur)),2),
+     kwh_hladid = ifelse(timistopp>timihlada & virk_100 == TRUE,kwh100,
+                         ifelse(timistopp>timihlada & virk_80 == TRUE,kwh80,timi_tengdur*as.numeric(hledsla_kw))),
+     stada_brottf = ifelse(stada_kwh+kwh_hladid>100,100,stada_kwh+kwh_hladid), #Skrifað út frá tegund 2, þar er battery 100kWh
+     stada_brottf_hlutf = stada_brottf/100, #Skrifað út frá tegund 2, þar er battery 100kWh
+     brottfarar_timi = timasetn_bill+timi_stopp,
+     otengdur_timi = timasetn_bill+ timi_tengdur)%>%
+     mutate(across(where(is.numeric), round, 2))%>%
+     separate(timasetn_bill, into=c("komu_klst","komu_min"), sep="\\.", convert=TRUE, fill="right")%>%
+     separate(brottfarar_timi, into=c("brottf_klst","brottf_min"), sep="\\.", convert=TRUE, fill="right")%>%
+     separate(otengdur_timi, into=c("otengdur_klst","otengdur_min"), sep="\\.", convert=TRUE, fill="right")%>%
+     mutate(komu_min= replace_na(komu_min, 0),
+            brottf_min = replace_na(brottf_min, 0),
+            otengdur_min = replace_na(otengdur_min, 0))%>%
+     mutate(komu_min = round((komu_min/100)*60,0),
+            brottf_min = round((brottf_min/100)*60,0),
+            otengdur_min = round((otengdur_min/100)*60,0))%>%
+     mutate(komu_timi = ymd_hms(paste("2020-01-01",komu_klst,komu_min,"00", sep="-")),
+            brottf_timi =ymd_hms(paste("2020-01-01",brottf_klst,brottf_min,"00", sep="-")),
+            otengdur_timi= ymd_hms(paste("2020-01-01",otengdur_klst,otengdur_min,"00", sep="-")))
+
+
+```
+
+```{r, echo=FALSE, warning =FALSE, message=FALSE}
+
+# Þurfum að breyta tímasetingum í timestamps og út frá því reikna rolling sums fyrir einkabíla, rafbíla og rafbíla að hlaða
+allir <-  ferdamenn%>%
+  select(komu_timi, brottf_timi, merki)
+
+rafbilar <-  ferdamenn%>%
+  filter(rafbill == 1)%>%
+  select(komu_timi, brottf_timi, merki)
+
+rafbilar_hlada <-  ferdamenn%>%
+     filter(hledur == 1 & rafbill==1)%>%
+     select(komu_timi, otengdur_timi, merki)
+
+
+# Þurfum að breyta tímasetingum í timestamps og út frá því reikna rolling sums fyrir einkabíla, rafbíla og rafbíla að hlaða
+ 
+ calc_roll_sum <- function(data, start_var, end_var,
+                           begin_time='2020-01-01 00:00:00'){
+   sv <- rlang::enquo(start_var)
+   ev <- rlang::enquo(end_var)
+   
+   if(!inherits(begin_time, 'POSIXct')){
+     begin_time <- lubridate::ymd_hms(begin_time)
+   }
+   
+   #Keep track of timestamp issues
+   incorrect_times <- data %>%
+     dplyr::filter(!!ev < !!sv | is.na(!!ev) | is.na(!!sv))%>%
+     dplyr::mutate(type = ifelse( is.na(!!ev),
+                                  'Missing end time',
+                                  ifelse(is.na(!!sv),
+                                         'Missing start time',
+                                         'End time before start time')))
+   
+   #Remove timestamp problems
+   filtered_data <- data %>%
+     dplyr::filter(!!sv <= !!ev)%>% # no end timestamps after start timestamps
+     dplyr::filter(!is.na(!!ev))%>% # no missing end times
+     dplyr::filter(!is.na(!!sv)) #no missing start times
+   
+   #get the base count
+   pre <- filtered_data %>%
+     dplyr::filter(!!sv<begin_time & !!ev >= begin_time)
+   
+   post <-  filtered_data%>%
+     dplyr::filter(!!ev >= begin_time)
+   
+   #The arrivals
+   arrivals <- post %>%
+     dplyr::select(timestamp = !!sv)%>%
+     dplyr::mutate(counter=1)%>% 
+     dplyr::filter(timestamp >= begin_time)
+   
+   
+   #The departures
+   departures <- post%>%
+     dplyr::select(timestamp = !!ev)%>%
+     dplyr::mutate(counter = -1)
+   
+   #bind the arrivals and departures
+   census_volumes <- arrivals %>%
+     dplyr::bind_rows(departures) %>%
+     dplyr::arrange(timestamp, counter)
+   
+   #Add the starting pre volume to the first row
+   census_volumes$counter[1] <- census_volumes$counter[1]+nrow(pre)
+   
+   census_volumes <- census_volumes%>% #Arrange by time
+     dplyr::mutate(volume=cumsum(counter))
+   
+   #Create a sequence of times from the start to end of available data
+   start <-  min(census_volumes$timestamp)
+   end <- max(census_volumes$timestamp)
+   full_time_window <-  dplyr::tibble(timestamp = seq( start, end, by='mins'))
+   
+   census_volumes <-  census_volumes %>%
+     right_join(full_time_window,
+                by='timestamp')%>% # bind with the full time window to fill gaps
+     arrange(timestamp)%>%
+     fill(volume, .direction='down') #take last observation carried forward
+   
+   if(nrow(incorrect_times)>0){
+     incorrect_times_sum <- incorrect_times %>%
+       dplyr::count(type)
+     
+     msg <- paste0(paste(incorrect_times_sum$type,
+                         incorrect_times_sum$n, seo =': n = '),
+                   collapse = '\n')
+     msg <- paste0('Potential Data Issues:\n',
+                   msg,
+                   '\nThese timestamp errors have been removed from the data prior to volume calculation')
+     message(msg)
+   }
+   
+   return(census_volumes)  
+   
+ }
+
+ 
+  #Sameinum df fyrir alla, rafbíla og rafbíla sem hlada
+
+ #GROUPAÐ EFTIR MERKI
+ allir_df <- allir%>%
+   dplyr::group_by(merki)%>%
+   calc_roll_sum(start_var = komu_timi, end_var = brottf_timi)%>%
+   ungroup()%>%
+   mutate(merki = as.factor(merki),
+          tegund = "allir")
+ 
+ rafb_df <-  rafbilar%>%
+   dplyr::group_by(merki)%>%
+   calc_roll_sum(start_var = komu_timi, end_var = brottf_timi)%>%
+   ungroup()%>%
+   mutate(merki = as.factor(merki),
+          tegund = "rafbilar")
+
+ rafb_hlada <-  rafbilar_hlada%>%
+   dplyr::group_by(merki)%>%
+   calc_roll_sum(start_var = komu_timi, end_var = otengdur_timi)%>%
+   ungroup()%>%
+   mutate(merki = as.factor(merki), 
+          tegund = "rafb_hlada")
+ 
+ sameinad_grouped <-  allir_df%>%
+   bind_rows(rafb_df)%>%
+   bind_rows(rafb_hlada)
+
+
+ 
+ # 15 min timestamp bil
+timar <-  seq(as.POSIXct("2020-01-01 00:00:00"),as.POSIXct("2020-01-02 00:00:00"), by = "30 min") 
+  
+ #EKKI GROUPAÐ EFTIR MERKI
+avrg_tot <- sameinad_grouped%>%
+     group_by(tegund, timestamp)%>%
+     summarise(volume = mean(volume))%>%
+     fill(volume)%>%
+   mutate(merki = fj_monte_carlo+1,
+          tegund2 = tegund,
+          tegund = ifelse(tegund2 == "allir", "allir_avrg",
+                          ifelse(tegund2 == "rafbilar", "rafbilar_avrg", "rafb_hlada_avrg")))%>%
+   select(merki, timestamp, volume, tegund)%>%
+   mutate(merki = as.factor(merki))%>%
+   filter(timestamp %in% timar)%>%
+   mutate(volume = round(volume))
+
+
+
+
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+#Plottum sameinaða df og meðaltöl
+
+
+
+plot_df <- sameinad_grouped%>%
+   select(-counter)%>%
+   bind_rows(avrg_tot)%>%
+   arrange(timestamp)
+
+levels(plot_df$tegund) <- c("allir","allir_avrg","rafbilar","rafbilar_avrg","rafb_hlada","rafb_hlada_avrg")
+
+lims <- as.POSIXct(strptime(c("2020-01-01 00:00", "2020-01-02 01:00"), 
+                   format = "%Y-%m-%d %H:%M"))
+
+plot <- ggplot(plot_df, aes(x=timestamp, y=volume, linetype=merki,color = tegund, alpha =tegund))+
+  geom_line(size=1)+
+  scale_x_datetime(limits = lims, date_breaks = "3 hours",
+                   labels = date_format("%H:%M") )+
+  scale_linetype_manual(values = rep(1,fj_monte_carlo+1), guide='none')+
+  scale_color_manual(values =c("black","blue","black","green","black","red"),
+                     breaks = c('allir_avrg','rafbilar_avrg','rafb_hlada_avrg'),
+                     labels =c("Meðalfjöldi bíla", "Meðalfjöldi rafbíla","Meðalfjöldi rafbíla að hlaða"),
+                     name = "")+
+  scale_alpha_manual(values = c(0,1,0,1,0,1), guide='none')+
+  labs(x = "Klukkustund", y ="Fjöldi bíla",
+       title = paste0("Staður: ",valinn_stadur),
+       subtitle= paste0("Hlutfall rafmagnsbíla: ", hlutf_rafbilar*100,"%      Mánuður: ágúst"))+
+  theme_minimal()+
+   theme(legend.position = "bottom")
+
+ggsave(plot, filename = paste0(valinn_stadur,"_",hlutf_rafbilar*100,".png"), dpi = 300, type = "cairo",
+       width = 6, height = 4, units = "in")
+```
+
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+
+#STÓRT FUNCTION SEM SPÝTIR ÚT UPPLÝSINGUM FYRIR HVERN MÁNUÐ
+
+stort_func <- function(manudurX){
+
+valinn_manudur <- manudurX
+
+manadar_fjoldi <- select(manudir, all_of(valinn_manudur))%>% #Náum í fjölda fyrir valinn mánuð
+  pull()
+
+fj_dag <- select(dagar, all_of(valinn_manudur))%>% 
+  pull() #Fjöldi á dag fyrir valinn mánuð
+
+
+fj_bila_dag <- round(fj_dag*hlutf_a_bil/fj_per_bil,0) #Fjöldi bíla á dag, miðum við fjölda bíla á dag út frá fjölda ferðamanna og hversu margir eru á einkabíl ÞAÐ SEM BREYTIST MILLI MÁNAÐA 
+
+#Drögum tímasetningar bíla út frá normaldreifingu byggt á toppi og breidd
+timasetningar <- if(valinn_stadur != "Keflavík"){
+  rtruncnorm(fj_bila_dag*fj_monte_carlo, opn_timi, lokunartimi, toppur_1, breidd_1)
+} else{
+  tibble(
+    fyrri = rtruncnorm(fj_bila_dag*fj_monte_carlo, opn_timi, lokunartimi, toppur_1, breidd_1),
+    seinni = rtruncnorm(fj_bila_dag*fj_monte_carlo, opn_timi, lokunartimi, toppur_2, breidd_2),
+    rand = sample(c(1,0),fj_bila_dag*fj_monte_carlo, replace = TRUE, prob=c(hlutf_1, hlutf_2)))%>%
+    mutate(val = ifelse(rand == 1, fyrri, seinni))%>%
+    select(val)%>%
+    pull(all_of(val))
+}
+
+#Hvort að bíll sé rafbíll eða ekki ræðst af hlutfalli rafbíla
+rafbill <- sample(c(0,1), fj_bila_dag*fj_monte_carlo, replace = T, prob =c(1-hlutf_rafbilar, hlutf_rafbilar))
+
+#Drögum upphafsstöðu rafhlöðu úr líkindadreifingu sem er fyrir áhrifum af uppbyggingu á gististöðum
+upphafst_rafh <-  if(hotel == TRUE){
+  rtruncnorm(fj_bila_dag*fj_monte_carlo, a = 0, b = 100, 95, 5)
+} else {
+      rtruncnorm(fj_bila_dag*fj_monte_carlo,0,100, 60, 25)
+}
+
+#Drögum tegund bíls úr líkindadreifingu með 3 möguleika sem eru fyrirfram ákveðnir
+teg_bils <- sample(c("teg1","teg2","teg3"),fj_bila_dag*fj_monte_carlo, replace=T, prob= c(0,1,0))
+
+#Drögum ekna km við komu á stað úr líkindadreifingu byggt á áætluðum upphafsstöðum
+eknir_km <- sample(c(km_std1, km_std2, km_std3), fj_bila_dag*fj_monte_carlo, replace = T, prob =c(hltf_std1, hltf_std2, hltf_std3))
+
+#Tími sem er stoppað
+timi_stopp <-  rtruncnorm(fj_bila_dag*fj_monte_carlo, 0, Inf, 1, 0.25) #Meðaltal klst, 15 min í staðalfrávik
+
+#Setjum inn dummy breytu fyrir Keflavík
+kef_func <- if (valinn_stadur == "Keflavík"){
+       rep(1, fj_bila_dag*fj_monte_carlo)
+     } else{
+      rep(0, fj_bila_dag*fj_monte_carlo)
+     }
+
+#Merking - Merkjum hverja MC hermun fyrir plot á eftir
+merking <- rep(c(1:fj_monte_carlo), each=fj_bila_dag)
+
+
+ferdamenn_df <- tibble(
+     timasetn_bill = timasetningar,
+     rafbill = rafbill,
+     upphafst_rafh = upphafst_rafh,
+     eknir_km = eknir_km,
+     keflavik = kef_func,
+     eftir_hadegi_kef = ifelse(timasetn_bill > 12 & keflavik == 1, 1, 0),
+     eknir_km2 = as.numeric(map2(eftir_hadegi_kef, eknir_km, kef_hadegi_func)),
+     teg_bils = teg_bils,
+     upph_stada_kwh = as.numeric(map2(teg_bils, upphafst_rafh, upph_stada_kwh)),
+     eydsla_kwh = as.numeric(map2(teg_bils, eknir_km2, eydsla_total)),
+     stada_kwh = as.numeric(map2(upph_stada_kwh, eydsla_kwh, loka_stada_kwh)),
+     kwh80 = as.numeric(map(stada_kwh, kwh_80)),
+     kwh100 = as.numeric(map(stada_kwh, kwh_100)),
+     stada_hlutf = as.numeric(map2(stada_kwh,upph_stada_kwh, loka_stada)),
+     likur_hlada = as.numeric(map2(stada_hlutf, keflavik, prop_hlada)),
+     hledur = as.numeric(map(likur_hlada, hledur)),
+     merki = merking,
+     timistopp = timi_stopp,
+     timihlada = round(as.numeric(pmap(list(kwh100,kwh80,timistopp), timi_hlada)),2),
+     timi_tengdur = round(as.numeric(pmap(list(kwh100,kwh80,timistopp), timi_tengdur)),2),
+     kwh_hladid = ifelse(timistopp>timihlada & virk_100 == TRUE,kwh100,
+                         ifelse(timistopp>timihlada & virk_80 == TRUE,kwh80,timi_tengdur*as.numeric(hledsla_kw))),
+     stada_brottf = ifelse(stada_kwh+kwh_hladid>100,100,stada_kwh+kwh_hladid), #Skrifað út frá tegund 2, þar er battery 100kWh
+     stada_brottf_hlutf = stada_brottf/100, #Skrifað út frá tegund 2, þar er battery 100kWh
+     brottfarar_timi = timasetn_bill+timi_stopp,
+     otengdur_timi = timasetn_bill+ timi_tengdur)%>%
+     mutate(across(where(is.numeric), round, 2))%>%
+     separate(timasetn_bill, into=c("komu_klst","komu_min"), sep="\\.", convert=TRUE, fill="right")%>%
+     separate(brottfarar_timi, into=c("brottf_klst","brottf_min"), sep="\\.", convert=TRUE, fill="right")%>%
+     separate(otengdur_timi, into=c("otengdur_klst","otengdur_min"), sep="\\.", convert=TRUE, fill="right")%>%
+     mutate(komu_min= replace_na(komu_min, 0),
+            brottf_min = replace_na(brottf_min, 0),
+            otengdur_min = replace_na(otengdur_min, 0))%>%
+     mutate(komu_min = round((komu_min/100)*60,0),
+            brottf_min = round((brottf_min/100)*60,0),
+            otengdur_min = round((otengdur_min/100)*60,0))%>%
+     mutate(komu_timi = ymd_hms(paste("2020-01-01",komu_klst,komu_min,"00", sep="-")),
+            brottf_timi =ymd_hms(paste("2020-01-01",brottf_klst,brottf_min,"00", sep="-")),
+            otengdur_timi= ymd_hms(paste("2020-01-01",otengdur_klst,otengdur_min,"00", sep="-")))
+
+
+# Þurfum að breyta tímasetingum í timestamps og út frá því reikna rolling sums fyrir einkabíla, rafbíla og rafbíla að hlaða
+allir <-  ferdamenn_df%>%
+  select(komu_timi, brottf_timi, merki)
+
+rafbilar <-  ferdamenn_df%>%
+  filter(rafbill == 1)%>%
+  select(komu_timi, brottf_timi, merki)
+
+rafbilar_hlada <-  ferdamenn_df%>%
+     filter(hledur == 1 & rafbill==1)%>%
+     select(komu_timi, otengdur_timi, merki)
+ #Sameinum df fyrir alla, rafbíla og rafbíla sem hlada
+
+ #GROUPAÐ EFTIR MERKI
+ allir_df <- allir%>%
+   dplyr::group_by(merki)%>%
+   calc_roll_sum(start_var = komu_timi, end_var = brottf_timi)%>%
+   ungroup()%>%
+   mutate(merki = as.factor(merki),
+          tegund = "allir")
+ 
+ rafb_df <-  rafbilar%>%
+   dplyr::group_by(merki)%>%
+   calc_roll_sum(start_var = komu_timi, end_var = brottf_timi)%>%
+   ungroup()%>%
+   mutate(merki = as.factor(merki),
+          tegund = "rafbilar")
+
+ rafb_hlada <-  rafbilar_hlada%>%
+   dplyr::group_by(merki)%>%
+   calc_roll_sum(start_var = komu_timi, end_var = otengdur_timi)%>%
+   ungroup()%>%
+   mutate(merki = as.factor(merki), 
+          tegund = "rafb_hlada")
+ 
+ sameinad_grouped <-  allir_df%>%
+   bind_rows(rafb_df)%>%
+   bind_rows(rafb_hlada)
+
+
+ 
+ # 15 min timestamp bil
+timar <-  seq(as.POSIXct("2020-01-01 00:00:00"),as.POSIXct("2020-01-02 00:00:00"), by = "30 min") 
+  
+ #EKKI GROUPAÐ EFTIR MERKI
+avrg_tot <- sameinad_grouped%>%
+     group_by(tegund, timestamp)%>%
+     summarise(volume = mean(volume))%>%
+     fill(volume)%>%
+   mutate(merki = fj_monte_carlo+1,
+          tegund2 = tegund,
+          tegund = ifelse(tegund2 == "allir", "allir_avrg",
+                          ifelse(tegund2 == "rafbilar", "rafbilar_avrg", "rafb_hlada_avrg")))%>%
+   select(merki, timestamp, volume, tegund)%>%
+   mutate(merki = as.factor(merki))%>%
+   filter(timestamp %in% timar)%>%
+   mutate(volume = round(volume))
+
+max_bilar <-  avrg_tot%>%
+     filter(tegund == "allir_avrg")%>%
+     select(volume)%>%
+     pull()%>%
+     max()
+
+max_rafbilar <- avrg_tot%>%
+     filter(tegund == "rafbilar_avrg")%>%
+     select(volume)%>%
+     pull()%>%
+     max()
+
+max_hlada <- avrg_tot%>%
+     filter(tegund == "rafb_hlada_avrg")%>%
+     select(volume)%>%
+     pull()%>%
+     max()
+
+avrg_bilar <- avrg_tot%>%
+     filter(tegund == "allir_avrg")%>%
+     select(volume)%>%
+     pull()%>%
+     mean()
+
+avrg_rafbilar <- avrg_tot%>%
+     filter(tegund == "rafbilar_avrg")%>%
+     select(volume)%>%
+     pull()%>%
+     mean()
+
+avrg_hlada <- avrg_tot%>%
+     filter(tegund == "rafb_hlada_avrg")%>%
+     select(volume)%>%
+     pull()%>%
+     mean()
+
+#Staða rafhlöðu í upphafi, meðalfjarlægð ekin, meðalstaða rafhlöðu við komu, meðal líkur á ða hlaða, meðaltími að hlaða, meðaltími  sem bílar stöðva os frv er óbreytt milli mánaða en læt það fylgja í df
+
+stada_upphaf <- ferdamenn_df%>%
+    select(upphafst_rafh)%>%
+    pull()%>%
+    mean()
+
+medal_km <- ferdamenn_df%>%
+     select(eknir_km2)%>%
+     pull()%>%
+     mean()
+
+stada_v_komu <- ferdamenn_df%>%
+     select(stada_hlutf)%>%
+     pull()%>%
+     mean()
+
+likur_hlada <- ferdamenn_df%>%
+     filter(rafbill == 1)%>%
+     select(likur_hlada)%>%
+     pull()%>%
+     mean()
+
+timi_100 <-  ferdamenn_df%>%
+     filter(rafbill == 1, hledur == 1)%>%
+     select(kwh100)%>%
+     mutate(avrg_100 = kwh100/hledsla_kw*60)%>%
+     select(avrg_100)%>%
+     pull()%>%
+     mean()
+
+avrg_stop <-  ferdamenn_df%>%
+     filter(rafbill == 1, hledur == 1)%>%
+     select(timistopp)%>%
+     mutate(timistopp = timistopp*60)%>%
+     pull()%>%
+     mean()
+
+avrg_tengdur <-  ferdamenn_df%>%
+     filter(rafbill == 1, hledur == 1)%>%
+     select(timi_tengdur)%>%
+     mutate(timi_tengdur = timi_tengdur*60)%>%
+     pull()%>%
+     mean()
+
+avrg_kwh <-  ferdamenn_df%>%
+     filter(rafbill == 1, hledur == 1)%>%
+     select(kwh_hladid)%>%
+     pull()%>%
+     mean()
+
+stada_v_brottf <-  ferdamenn_df%>%
+     filter(rafbill == 1)%>%
+     select(stada_brottf)%>%
+     pull()%>%
+     mean()
+   
+
+c(max_bilar,max_rafbilar, max_hlada ,avrg_bilar,avrg_rafbilar,avrg_hlada,
+  stada_upphaf,medal_km, stada_v_komu, likur_hlada, timi_100, avrg_stop,avrg_tengdur, avrg_kwh, stada_v_brottf )
+
+
+}
+
+
+```
+
+```{r, message=FALSE, echo=FALSE, warning = FALSE}
+allir_man <- tibble(
+   manudir = c('jan', 'feb', 'mar', 'apr', 'mai', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec')
+)%>%
+   mutate(mun_ekki_virka=map(manudir, stort_func))
+
+allir_man <- allir_man %>%
+   unnest_wider(mun_ekki_virka)%>%
+   mutate(across(where(is.numeric), round, 2))
+
+colnames(allir_man) <-  c("man", "max_bilar", "max_rafbilar", "max_hlada", "avrg_bilar", "avrg_rafbilar","avrg_hlada",
+                      "stada_upphaf", "medal_km", "stada_v_komu" ,"likur_hlada","timi_100", "avrg_stop", "avrg_tengdur", "avrg_kwh", "avrg_kwh", "avrg_kwh")
+
+write_csv(allir_man,
+          paste0(valinn_stadur,"_",hlutf_rafbilar*100,"_80.csv"))
+```
+
+
+```{r}
+1+1
+```
+

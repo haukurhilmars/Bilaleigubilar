@@ -1,0 +1,14 @@
+name: bilaleigubilar
+title: bilaleigubilar
+username:
+account: haukur
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 5874583
+bundleId: 5695370
+url: https://haukur.shinyapps.io/bilaleigubilar/
+when: 1647525395.37917
+lastSyncTime: 1647525395.37917
+asMultiple: FALSE
+asStatic: FALSE
+ignoredFiles: development.R|vinnuskjal.Rmd
